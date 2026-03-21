@@ -1,0 +1,5 @@
+INFO request accepted
+INFO request finished
+WARNING high latency detected
+ERROR timeout on upstream
+ERROR retry exhausted
