@@ -22,7 +22,9 @@ ssize_t read_full(int fd, void *buf, size_t count) {
             }
             return -1;
         }
-        total += (size_t)bytes_read;
+        if (bytes_read > 0) {
+            total += (size_t)bytes_read;
+        }
     }
 
     return (ssize_t)total;
@@ -34,6 +36,10 @@ int write_full(int fd, const void *buf, size_t count) {
 
     while (total < count) {
         ssize_t bytes_written = write(fd, cursor + total, count - total);
+        if (bytes_written == 0) {
+            errno = EPIPE;
+            return -1;
+        }
         if (bytes_written < 0) {
             if (errno == EINTR) {
                 continue;

@@ -20,13 +20,31 @@ typedef struct {
     int result_pipe[2];
     bool busy;
     bool terminated;
+    const char *assigned_path;
 } worker_state_t;
 
-static void close_fd_if_open(int *fd) {
+typedef struct {
+    size_t successful_files;
+    size_t failed_files;
+    uint64_t total_lines;
+    uint64_t total_errors;
+    uint64_t total_warnings;
+} aggregate_summary_t;
+
+static int close_fd_if_open(int *fd, const char *what) {
     if (*fd >= 0) {
-        close(*fd);
+        if (close(*fd) < 0) {
+            int saved_errno = errno;
+
+            fprintf(stderr, "%s: close failed: %s\n", what, strerror(saved_errno));
+            *fd = -1;
+            errno = saved_errno;
+            return -1;
+        }
         *fd = -1;
     }
+
+    return 0;
 }
 
 static void init_workers(worker_state_t workers[WORKER_COUNT]) {
@@ -40,6 +58,7 @@ static void init_workers(worker_state_t workers[WORKER_COUNT]) {
         workers[i].result_pipe[1] = -1;
         workers[i].busy = false;
         workers[i].terminated = false;
+        workers[i].assigned_path = NULL;
     }
 }
 
@@ -47,10 +66,10 @@ static void close_all_worker_fds(worker_state_t workers[WORKER_COUNT]) {
     size_t i;
 
     for (i = 0; i < WORKER_COUNT; ++i) {
-        close_fd_if_open(&workers[i].task_pipe[0]);
-        close_fd_if_open(&workers[i].task_pipe[1]);
-        close_fd_if_open(&workers[i].result_pipe[0]);
-        close_fd_if_open(&workers[i].result_pipe[1]);
+        (void)close_fd_if_open(&workers[i].task_pipe[0], "close task pipe read end");
+        (void)close_fd_if_open(&workers[i].task_pipe[1], "close task pipe write end");
+        (void)close_fd_if_open(&workers[i].result_pipe[0], "close result pipe read end");
+        (void)close_fd_if_open(&workers[i].result_pipe[1], "close result pipe write end");
     }
 }
 
@@ -59,11 +78,11 @@ static int create_pipes(worker_state_t workers[WORKER_COUNT]) {
 
     for (i = 0; i < WORKER_COUNT; ++i) {
         if (pipe(workers[i].task_pipe) < 0) {
+            close_all_worker_fds(workers);
             return -1;
         }
         if (pipe(workers[i].result_pipe) < 0) {
-            close_fd_if_open(&workers[i].task_pipe[0]);
-            close_fd_if_open(&workers[i].task_pipe[1]);
+            close_all_worker_fds(workers);
             return -1;
         }
     }
@@ -71,26 +90,42 @@ static int create_pipes(worker_state_t workers[WORKER_COUNT]) {
     return 0;
 }
 
-static void close_child_unused_fds(worker_state_t workers[WORKER_COUNT], size_t self_index) {
+static int close_child_unused_fds(worker_state_t workers[WORKER_COUNT], size_t self_index) {
     size_t i;
 
     for (i = 0; i < WORKER_COUNT; ++i) {
-        close_fd_if_open(&workers[i].task_pipe[1]);
-        close_fd_if_open(&workers[i].result_pipe[0]);
+        if (close_fd_if_open(&workers[i].task_pipe[1], "child close task pipe write end") < 0) {
+            return -1;
+        }
+        if (close_fd_if_open(&workers[i].result_pipe[0], "child close result pipe read end") < 0) {
+            return -1;
+        }
         if (i != self_index) {
-            close_fd_if_open(&workers[i].task_pipe[0]);
-            close_fd_if_open(&workers[i].result_pipe[1]);
+            if (close_fd_if_open(&workers[i].task_pipe[0], "child close foreign task pipe read end") < 0) {
+                return -1;
+            }
+            if (close_fd_if_open(&workers[i].result_pipe[1], "child close foreign result pipe write end") < 0) {
+                return -1;
+            }
         }
     }
+
+    return 0;
 }
 
-static void close_parent_unused_fds(worker_state_t workers[WORKER_COUNT]) {
+static int close_parent_unused_fds(worker_state_t workers[WORKER_COUNT]) {
     size_t i;
 
     for (i = 0; i < WORKER_COUNT; ++i) {
-        close_fd_if_open(&workers[i].task_pipe[0]);
-        close_fd_if_open(&workers[i].result_pipe[1]);
+        if (close_fd_if_open(&workers[i].task_pipe[0], "parent close task pipe read end") < 0) {
+            return -1;
+        }
+        if (close_fd_if_open(&workers[i].result_pipe[1], "parent close result pipe write end") < 0) {
+            return -1;
+        }
     }
+
+    return 0;
 }
 
 static int spawn_workers(worker_state_t workers[WORKER_COUNT]) {
@@ -105,7 +140,10 @@ static int spawn_workers(worker_state_t workers[WORKER_COUNT]) {
         if (pid == 0) {
             int child_status;
 
-            close_child_unused_fds(workers, i);
+            if (close_child_unused_fds(workers, i) < 0) {
+                _exit(EXIT_FAILURE);
+            }
+
             child_status = run_worker(workers[i].task_pipe[0], workers[i].result_pipe[1]);
             _exit(child_status);
         }
@@ -134,6 +172,7 @@ static int dispatch_analyze_task(worker_state_t *worker, const char *path) {
     }
 
     worker->busy = true;
+    worker->assigned_path = path;
     return 0;
 }
 
@@ -146,10 +185,13 @@ static int send_terminate_task(worker_state_t *worker) {
     if (send_task(worker->task_pipe[1], &task) < 0) {
         return -1;
     }
+    if (close_fd_if_open(&worker->task_pipe[1], "parent close terminated worker task pipe write end") < 0) {
+        return -1;
+    }
 
-    close_fd_if_open(&worker->task_pipe[1]);
     worker->busy = false;
     worker->terminated = true;
+    worker->assigned_path = NULL;
     return 0;
 }
 
@@ -175,6 +217,55 @@ static void print_result(size_t worker_index, const result_msg_t *result) {
     );
 }
 
+static void update_summary(aggregate_summary_t *summary, const result_msg_t *result) {
+    if (result->status == 0) {
+        summary->successful_files++;
+        summary->total_lines += result->line_count;
+        summary->total_errors += result->error_count;
+        summary->total_warnings += result->warning_count;
+        return;
+    }
+
+    summary->failed_files++;
+}
+
+static void print_summary(const aggregate_summary_t *summary) {
+    printf(
+        "summary: successful=%zu failed=%zu total_lines=%" PRIu64 " total_errors=%" PRIu64
+        " total_warnings=%" PRIu64 "\n",
+        summary->successful_files,
+        summary->failed_files,
+        summary->total_lines,
+        summary->total_errors,
+        summary->total_warnings
+    );
+}
+
+static void describe_worker_status(size_t worker_index, worker_state_t *worker) {
+    int status;
+    pid_t wait_result;
+
+    wait_result = waitpid(worker->pid, &status, WNOHANG);
+    if (wait_result == 0) {
+        fprintf(stderr, "worker %zu is still running but its result pipe closed unexpectedly\n", worker_index + 1);
+        return;
+    }
+    if (wait_result < 0) {
+        fprintf(stderr, "worker %zu status check failed: %s\n", worker_index + 1, strerror(errno));
+        return;
+    }
+
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "worker %zu exited with status %d\n", worker_index + 1, WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, "worker %zu was terminated by signal %d\n", worker_index + 1, WTERMSIG(status));
+    } else {
+        fprintf(stderr, "worker %zu changed state unexpectedly\n", worker_index + 1);
+    }
+
+    worker->pid = -1;
+}
+
 static int seed_initial_tasks(
     worker_state_t workers[WORKER_COUNT],
     char *argv[],
@@ -193,6 +284,7 @@ static int seed_initial_tasks(
 }
 
 static int run_scheduler(worker_state_t workers[WORKER_COUNT], char *argv[], int argc) {
+    aggregate_summary_t summary = {0};
     size_t completed_files = 0;
     size_t terminated_workers = 0;
     int next_file_index = 0;
@@ -248,13 +340,22 @@ static int run_scheduler(worker_state_t workers[WORKER_COUNT], char *argv[], int
             ready_count--;
             recv_status = recv_result(workers[i].result_pipe[0], &result);
             if (recv_status != 1) {
+                fprintf(
+                    stderr,
+                    "worker %zu stopped before sending a complete result for %s\n",
+                    i + 1,
+                    workers[i].assigned_path != NULL ? workers[i].assigned_path : "<no assigned file>"
+                );
+                describe_worker_status(i, &workers[i]);
                 errno = recv_status == 0 ? EPROTO : errno;
                 return -1;
             }
 
             workers[i].busy = false;
+            workers[i].assigned_path = NULL;
             completed_files++;
             print_result(i, &result);
+            update_summary(&summary, &result);
 
             if (next_file_index < argc) {
                 if (dispatch_analyze_task(&workers[i], argv[next_file_index]) < 0) {
@@ -275,6 +376,7 @@ static int run_scheduler(worker_state_t workers[WORKER_COUNT], char *argv[], int
         return -1;
     }
 
+    print_summary(&summary);
     return 0;
 }
 
@@ -339,7 +441,9 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
-    close_parent_unused_fds(workers);
+    if (close_parent_unused_fds(workers) < 0) {
+        goto cleanup;
+    }
 
     if (run_scheduler(workers, argv, argc) < 0) {
         perror("scheduler");
