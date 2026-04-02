@@ -1,16 +1,24 @@
 #include "worker.h"
 
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "ipc.h"
 #include "log_stats.h"
 #include "protocol.h"
 
-static void close_fd_if_open(int fd) {
+static int close_fd_if_open(int fd, const char *what) {
     if (fd >= 0) {
-        close(fd);
+        if (close(fd) < 0) {
+            fprintf(stderr, "%s: %s\n", what, strerror(errno));
+            return -1;
+        }
     }
+
+    return 0;
 }
 
 int run_worker(int task_fd, int result_fd) {
@@ -20,7 +28,12 @@ int run_worker(int task_fd, int result_fd) {
         task_msg_t task;
         int recv_status = recv_task(task_fd, &task);
 
-        if (recv_status != 1) {
+        if (recv_status == 0) {
+            fprintf(stderr, "worker: task pipe closed unexpectedly\n");
+            goto cleanup;
+        }
+        if (recv_status < 0) {
+            fprintf(stderr, "worker: failed to receive task: %s\n", strerror(errno));
             goto cleanup;
         }
 
@@ -30,6 +43,7 @@ int run_worker(int task_fd, int result_fd) {
         }
 
         if (task.type != TASK_ANALYZE) {
+            fprintf(stderr, "worker: received unknown task type %d\n", task.type);
             goto cleanup;
         }
 
@@ -37,12 +51,17 @@ int run_worker(int task_fd, int result_fd) {
         analyze_log_file(task.path, &result);
 
         if (send_result(result_fd, &result) < 0) {
+            fprintf(stderr, "worker: failed to send result for %s: %s\n", task.path, strerror(errno));
             goto cleanup;
         }
     }
 
 cleanup:
-    close_fd_if_open(task_fd);
-    close_fd_if_open(result_fd);
+    if (close_fd_if_open(task_fd, "worker close task fd failed") < 0) {
+        exit_code = EXIT_FAILURE;
+    }
+    if (close_fd_if_open(result_fd, "worker close result fd failed") < 0) {
+        exit_code = EXIT_FAILURE;
+    }
     return exit_code;
 }
